@@ -124,14 +124,15 @@ func TestRouteFromSandboxDerivation(t *testing.T) {
 		}
 	}
 	tests := []struct {
-		name        string
-		sandbox     *agentsv1alpha1.Sandbox
-		expectID    string
-		expectToken string
-		expectAuth  bool
-		expectState string
-		expectIP    string
-		expectError string
+		name           string
+		sandbox        *agentsv1alpha1.Sandbox
+		expectID       string
+		expectToken    string
+		expectAuth     bool
+		expectState    string
+		expectIP       string
+		expectError    string
+		expectEndpoint bool
 	}{
 		{
 			name:     "legacy ID resolution",
@@ -185,6 +186,25 @@ func TestRouteFromSandboxDerivation(t *testing.T) {
 			expectID:    "ns--name",
 			expectState: agentsv1alpha1.SandboxStateCreating,
 			expectIP:    "",
+		},
+		{
+			name: "hostname endpoint without pod IP remains running",
+			sandbox: func() *agentsv1alpha1.Sandbox {
+				sandbox := newSandbox(nil, nil)
+				sandbox.Status.PodInfo.PodIP = ""
+				sandbox.Status.Endpoint = &agentsv1alpha1.SandboxEndpoint{
+					Mode:       agentsv1alpha1.SandboxEndpointModeHostname,
+					Address:    "front.example.com:443",
+					Authority:  "{port}-name.sbx.example.com",
+					PathPrefix: "/kruise/name/{port}",
+					Headers:    map[string]string{"e2b-sandbox-port": "{port}"},
+				}
+				return sandbox
+			}(),
+			expectID:       "ns--name",
+			expectState:    agentsv1alpha1.SandboxStateRunning,
+			expectIP:       "",
+			expectEndpoint: true,
 		},
 		{
 			name: "paused sandbox projects paused state",
@@ -241,6 +261,15 @@ func TestRouteFromSandboxDerivation(t *testing.T) {
 			assert.Equal(t, "owner", route.Owner)
 			assert.Equal(t, tt.expectToken, route.AccessToken)
 			assert.Equal(t, tt.expectAuth, route.RequireTrafficAuth)
+			if tt.expectEndpoint {
+				require.NotNil(t, route.Endpoint)
+				assert.Equal(t, tt.sandbox.Status.Endpoint, route.Endpoint)
+				assert.NotSame(t, tt.sandbox.Status.Endpoint, route.Endpoint)
+				route.Endpoint.Headers["e2b-sandbox-port"] = "changed"
+				assert.Equal(t, "{port}", tt.sandbox.Status.Endpoint.Headers["e2b-sandbox-port"])
+			} else {
+				assert.Nil(t, route.Endpoint)
+			}
 		})
 	}
 }

@@ -36,6 +36,7 @@ import (
 	agentsv1alpha1 "github.com/openkruise/agents/api/v1alpha1"
 
 	"github.com/openkruise/agents/pkg/features"
+	"github.com/openkruise/agents/pkg/sandboxendpoint"
 	utilfeature "github.com/openkruise/agents/pkg/utils/feature"
 )
 
@@ -272,6 +273,21 @@ func GetSandboxState(sbx *agentsv1alpha1.Sandbox) (state string, reason string) 
 			return agentsv1alpha1.SandboxStatePaused, "NotRunningResourceClaimed"
 		}
 	}
+}
+
+// IsSandboxAddressable reports whether a sandbox has enough endpoint
+// information for callers to reach it. A nil endpoint preserves direct Pod IP
+// addressing; hostname addressing deliberately ignores a placeholder Pod IP.
+func IsSandboxAddressable(sbx *agentsv1alpha1.Sandbox) bool {
+	if sbx == nil {
+		return false
+	}
+	attrs := sandboxendpoint.Attrs{PodIP: sbx.Status.PodInfo.PodIP}
+	if sbx.Status.Endpoint != nil {
+		attrs.Mode = string(sbx.Status.Endpoint.Mode)
+		attrs.Address = sbx.Status.Endpoint.Address
+	}
+	return sandboxendpoint.Addressable(attrs)
 }
 func IsControlledBySandboxSet(sbx *agentsv1alpha1.Sandbox) bool {
 	controller := metav1.GetControllerOfNoCopy(sbx)

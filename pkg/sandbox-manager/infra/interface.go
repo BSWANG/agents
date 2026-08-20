@@ -264,7 +264,9 @@ type Sandbox interface {
 	metav1.Object                                         // For K8s object metadata access
 	Pause(ctx context.Context, opts PauseOptions) error   // Pause a Sandbox
 	Resume(ctx context.Context, opts ResumeOptions) error // Resume a paused Sandbox
-	GetIP() string
+	// GetEndpointAddress returns the Pod IP for Direct addressing or the front
+	// host:port for Hostname addressing. Empty means the Sandbox is not addressable.
+	GetEndpointAddress() string
 	GetState() (string, string) // Get Sandbox State (pending, running, paused, killing, etc.)
 	// GetSandboxID returns the label-aware public Sandbox ID: the short ID from
 	// the sandbox-id label when assigned, otherwise the legacy namespace--name form.

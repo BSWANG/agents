@@ -206,8 +206,8 @@ type runtimeClient struct {
 	// on tlsPort and verify the server certificate against authority while
 	// dialing the sandbox Pod IP (the curl --resolve behaviour, see
 	// newPinnedTransport). tlsClientConfig is built once at construction time;
-	// tlsConfigErr captures a construction failure so call() can surface it as a
-	// permanent error instead of retrying.
+	// tlsConfigErr captures a construction failure, which resolveTransport reports
+	// as a permanentError instead of retrying it.
 	tlsEnabled      bool
 	tlsBundle       *TLSBundle
 	authority       string
@@ -281,10 +281,23 @@ func (r *runtimeClient) Process() ProcessAPI {
 // connection goes to the sandbox Pod IP. The transport is rebuilt per call
 // because a refresh may change the Pod IP between attempts.
 func (r *runtimeClient) resolveTransport(sbx *agentsv1alpha1.Sandbox, plainClient *http.Client) (string, *http.Client, error) {
-	// A TLS-config construction failure is permanent: report it before spending
-	// an attempt on a client that cannot handshake.
+	// Hostname addressing is decided per sandbox, so it is resolved before the TLS
+	// switch: the front owns the leg to the runtime, which makes the runtime TLS
+	// bundle irrelevant for this call rather than a downgrade.
+	if target, ok, err := r.viaFront(sbx); ok {
+		if err != nil {
+			return "", nil, err
+		}
+		return target.BaseURL(), decorate(plainClient, target), nil
+	}
+
+	// A TLS-config construction failure is permanent: no retry can produce a
+	// client that handshakes, so mark it and let the predicate stop immediately.
+	// An endpoint resolution failure above is deliberately not marked: an
+	// unaddressable endpoint is the normal state of a sandbox whose writer has
+	// not published an address yet, and the next attempt may find one.
 	if r.tlsEnabled && r.tlsConfigErr != nil {
-		return "", nil, fmt.Errorf("invalid runtime TLS configuration: %w", r.tlsConfigErr)
+		return "", nil, &permanentError{err: fmt.Errorf("invalid runtime TLS configuration: %w", r.tlsConfigErr)}
 	}
 	base := r.resolveBaseURL(sbx)
 	if base == "" {
@@ -335,6 +348,27 @@ func (r *runtimeClient) dialIPFor(sbx *agentsv1alpha1.Sandbox) string {
 // derived from the Pod IP of the given sandbox and may still be empty before a
 // refresh resolves it.
 func (r *runtimeClient) transportLogValues(sbx *agentsv1alpha1.Sandbox) []any {
+	// Hostname addressing is decided before the TLS switch, so report the front
+	// target rather than the pinned-dial values: this call performs no forced
+	// resolution, does not apply the runtime TLS bundle even when the sandbox
+	// advertises one, and r.tlsEnabled only selects which sandbox port the front
+	// is asked to reach. Reporting the TLS-mode values here would claim a dial to
+	// a Pod IP that never happened.
+	if target, ok, err := r.viaFront(sbx); ok {
+		values := []any{
+			"transport", "front",
+			"sandboxPort", r.runtimePort(),
+			"runtimeTLSApplied", false,
+			"forcedResolution", false,
+		}
+		if err != nil {
+			return append(values, "endpointError", err.Error())
+		}
+		return append(values,
+			"endpoint", target.BaseURL(),
+			"authority", target.Authority,
+		)
+	}
 	if !r.tlsEnabled {
 		// Plain HTTP addresses the runtime by the URL host itself, so there is
 		// nothing to force-resolve.
@@ -431,12 +465,6 @@ func (e *APIError) IsClientError() bool {
 func (r *runtimeClient) call(ctx context.Context, method, path string, reqBody, respOut any) error {
 	log := klog.FromContext(ctx).WithValues("sandbox", klog.KObj(r.sbx))
 	debugLog := log.V(utils.DebugLogLevel)
-
-	// A TLS-config construction failure is a permanent, non-retryable error:
-	// surface it before entering the retry loop.
-	if r.tlsEnabled && r.tlsConfigErr != nil {
-		return fmt.Errorf("invalid runtime TLS configuration: %w", r.tlsConfigErr)
-	}
 
 	// Marshal the request body once: a marshal failure is a permanent,
 	// non-retryable programming error.
@@ -566,16 +594,32 @@ func (r *runtimeClient) call(ctx context.Context, method, path string, reqBody, 
 	})
 }
 
+// permanentError marks a failure that no attempt can fix, so the retry predicate
+// stops on the first one instead of spending the whole backoff on it. Transport
+// misconfiguration is the case that matters: it is decided at construction time
+// and identical on every attempt.
+type permanentError struct {
+	err error
+}
+
+func (e *permanentError) Error() string { return e.err.Error() }
+
+func (e *permanentError) Unwrap() error { return e.err }
+
 // retriableRuntimeError builds the retry predicate for call. It stops retrying
-// once the context is cancelled, treats a 4xx *APIError as permanent, and treats
-// everything else (transport errors, unresolved URL, refresh failures, 5xx) as
-// transient.
+// once the context is cancelled, on a *permanentError, and on a 4xx *APIError;
+// everything else (transport errors, unresolved URL or endpoint, refresh
+// failures, 5xx) is transient.
 func retriableRuntimeError(ctx context.Context) func(error) bool {
 	return func(err error) bool {
 		if err == nil {
 			return false
 		}
 		if ctx.Err() != nil {
+			return false
+		}
+		var permErr *permanentError
+		if errors.As(err, &permErr) {
 			return false
 		}
 		var apiErr *APIError

@@ -100,7 +100,7 @@ spec:
               cpu: "500m"
               memory: "1Gi"
         - name: envoy-proxy
-          image: envoyproxy/envoy:v1.33-latest
+          image: envoyproxy/envoy:v1.37.3
           imagePullPolicy: IfNotPresent
           args:
             - "--config-path /etc/envoy/envoy.yaml"

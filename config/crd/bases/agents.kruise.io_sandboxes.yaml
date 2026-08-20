@@ -289,6 +289,44 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              endpoint:
+                description: |-
+                  Endpoint declares how this sandbox is addressed. A nil Endpoint means
+                  SandboxEndpointModeDirect via PodInfo.PodIP, which is the behavior of every
+                  sandbox created before this field existed.
+                properties:
+                  address:
+                    description: |-
+                      Address is the host and port to connect to, e.g. sbx-alb.example.com:443.
+                      Required when Mode is Hostname.
+                    type: string
+                  authority:
+                    description: |-
+                      Authority replaces the Host / :authority header, e.g.
+                      {port}-sbx7f3a.sbx.example.com. Empty keeps Address as the authority.
+                    type: string
+                  headers:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      Headers are sent with every request to this sandbox, e.g.
+                      {"e2b-sandbox-id": "sbx7f3a", "e2b-sandbox-port": "{port}"}.
+                    type: object
+                    x-kubernetes-map-type: granular
+                  mode:
+                    description: Mode is the addressing mode.
+                    type: string
+                  pathPrefix:
+                    description: PathPrefix is prepended to the request path, e.g.
+                      /kruise/sbx7f3a/{port}.
+                    type: string
+                  scheme:
+                    description: Scheme is http or https for the hop to Address. Defaults
+                      to https.
+                    type: string
+                required:
+                - mode
+                type: object
               message:
                 description: message
                 type: string

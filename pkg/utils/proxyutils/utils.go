@@ -24,11 +24,14 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// ProxyRequest proxies the request to the sandbox
-// When apiServerURL is provided, it will proxy through the apiServer (requires restConfig to be provided as well, otherwise connect directly via SandboxIP
+// ProxyRequest proxies the request to the sandbox using the default HTTP client.
 func ProxyRequest(r *http.Request) (*http.Response, error) {
+	return proxyRequest(http.DefaultClient, r)
+}
+
+func proxyRequest(client *http.Client, r *http.Request) (*http.Response, error) {
 	log := klog.FromContext(r.Context())
-	resp, err := http.DefaultClient.Do(r) // #nosec G704 -- request URL constructed by upstream proxy logic
+	resp, err := client.Do(r) // #nosec G704 -- request URL constructed by upstream proxy logic
 	if err != nil {
 		return nil, fmt.Errorf("failed to proxy request to sandbox: %w", err)
 	}

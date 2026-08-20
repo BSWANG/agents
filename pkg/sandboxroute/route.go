@@ -25,22 +25,24 @@ import (
 
 	agentsv1alpha1 "github.com/openkruise/agents/api/v1alpha1"
 	"github.com/openkruise/agents/pkg/identity"
+	"github.com/openkruise/agents/pkg/sandboxendpoint"
 	"github.com/openkruise/agents/pkg/sandboxid"
 	"github.com/openkruise/agents/pkg/utils"
 )
 
 // Route represents one sandbox routing rule.
 type Route struct {
-	IP                 string    `json:"ip"`
-	ID                 string    `json:"id"`
-	Namespace          string    `json:"namespace,omitempty"`
-	Name               string    `json:"name,omitempty"`
-	UID                types.UID `json:"uid"`
-	Owner              string    `json:"owner"`
-	State              string    `json:"state"`
-	ResourceVersion    string    `json:"resourceVersion"`
-	AccessToken        string    `json:"accessToken,omitempty"`
-	RequireTrafficAuth bool      `json:"requireTrafficAuth,omitempty"`
+	IP                 string                          `json:"ip"`
+	Endpoint           *agentsv1alpha1.SandboxEndpoint `json:"endpoint,omitempty"`
+	ID                 string                          `json:"id"`
+	Namespace          string                          `json:"namespace,omitempty"`
+	Name               string                          `json:"name,omitempty"`
+	UID                types.UID                       `json:"uid"`
+	Owner              string                          `json:"owner"`
+	State              string                          `json:"state"`
+	ResourceVersion    string                          `json:"resourceVersion"`
+	AccessToken        string                          `json:"accessToken,omitempty"`
+	RequireTrafficAuth bool                            `json:"requireTrafficAuth,omitempty"`
 }
 
 // String implements fmt.Stringer without exposing the access token.
@@ -57,6 +59,22 @@ func (r Route) ObjectKey() (types.NamespacedName, bool) {
 		return types.NamespacedName{}, false
 	}
 	return types.NamespacedName{Namespace: r.Namespace, Name: r.Name}, true
+}
+
+// ResolveEndpoint resolves this projected route for one Sandbox port. Keeping
+// API projection here gives ext-proc and sandbox-gateway the same target without
+// either data plane depending on controller or manager code.
+func (r Route) ResolveEndpoint(port int) (sandboxendpoint.Target, error) {
+	attrs := sandboxendpoint.Attrs{PodIP: r.IP}
+	if r.Endpoint != nil {
+		attrs.Mode = string(r.Endpoint.Mode)
+		attrs.Address = r.Endpoint.Address
+		attrs.Scheme = r.Endpoint.Scheme
+		attrs.Authority = r.Endpoint.Authority
+		attrs.PathPrefix = r.Endpoint.PathPrefix
+		attrs.Headers = r.Endpoint.Headers
+	}
+	return sandboxendpoint.Resolve(attrs, port)
 }
 
 func (r Route) validate() error {
@@ -85,11 +103,10 @@ func validateResourceVersion(rv string) error {
 	return err
 }
 
-// RouteFromSandbox constructs a Route from a Sandbox CR. ID, access-token,
-// and traffic-auth derivation are centralized here so every component
-// projects routes with identical compatibility policy. A sandbox without a
-// Pod IP is always treated as creating, matching the existing manager and
-// gateway behavior.
+// RouteFromSandbox constructs a Route from a Sandbox CR. Endpoint, ID,
+// access-token, and traffic-auth derivation are centralized here so every
+// component projects routes with identical compatibility policy. A sandbox
+// without an addressable endpoint is treated as creating.
 func RouteFromSandbox(sandbox *agentsv1alpha1.Sandbox) (Route, error) {
 	if sandbox == nil {
 		return Route{}, errors.New("project route: sandbox is nil")
@@ -97,13 +114,14 @@ func RouteFromSandbox(sandbox *agentsv1alpha1.Sandbox) (Route, error) {
 
 	ip := sandbox.Status.PodInfo.PodIP
 	state := agentsv1alpha1.SandboxStateCreating
-	if ip != "" {
+	if utils.IsSandboxAddressable(sandbox) {
 		state, _ = utils.GetSandboxState(sandbox)
 	}
 	annotations := sandbox.GetAnnotations()
 
 	route := Route{
 		IP:                 ip,
+		Endpoint:           sandbox.Status.Endpoint.DeepCopy(),
 		ID:                 sandboxid.Resolve(sandbox),
 		Namespace:          sandbox.Namespace,
 		Name:               sandbox.Name,

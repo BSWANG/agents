@@ -49,7 +49,7 @@ func TestSandboxRouteSourceSubscribe(t *testing.T) {
 	provider.handler.OnAdd(sandbox, false)
 	require.Len(t, events, 1)
 	require.NotNil(t, events[0].Sandbox)
-	assert.Equal(t, "10.0.0.1", events[0].Sandbox.GetIP())
+	assert.Equal(t, "10.0.0.1", events[0].Sandbox.GetEndpointAddress())
 
 	updated := sandbox.DeepCopy()
 	updated.ResourceVersion = "11"

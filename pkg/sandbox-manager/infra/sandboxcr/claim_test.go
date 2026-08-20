@@ -1259,7 +1259,7 @@ func TestSandboxReadyFailureMessage(t *testing.T) {
 			want: "sandbox default/sbx-1 is not ready before wait timeout: reason=inplace update is still in progress, state=running, ready=PodReady, inplaceUpdate=InplaceUpdating",
 		},
 		{
-			name: "sandbox has no pod ip",
+			name: "sandbox has no addressable endpoint",
 			sbx: &v1alpha1.Sandbox{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:       "sbx-1",
@@ -1278,7 +1278,7 @@ func TestSandboxReadyFailureMessage(t *testing.T) {
 					},
 				},
 			},
-			want: "sandbox default/sbx-1 is not ready before wait timeout: reason=sandbox has no pod IP, state=running, ready=PodReady",
+			want: "sandbox default/sbx-1 is not ready before wait timeout: reason=sandbox has no addressable endpoint, state=running, ready=PodReady",
 		},
 		{
 			name: "ready condition reports failure with message",

@@ -6,4 +6,4 @@
 # Envoy proxy image
 - op: replace
   path: /spec/template/spec/containers/1/image
-  value: envoyproxy/envoy:v1.33-latest
+  value: envoyproxy/envoy:v1.37.3

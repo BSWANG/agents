@@ -1964,3 +1964,47 @@ func TestIsLiveForQuota(t *testing.T) {
 		})
 	}
 }
+
+func TestIsSandboxAddressable(t *testing.T) {
+	tests := []struct {
+		name string
+		sbx  *agentsv1alpha1.Sandbox
+		want bool
+	}{
+		{name: "nil sandbox", want: false},
+		{
+			name: "direct sandbox with pod IP",
+			sbx:  &agentsv1alpha1.Sandbox{Status: agentsv1alpha1.SandboxStatus{PodInfo: agentsv1alpha1.PodInfo{PodIP: "10.0.0.1"}}},
+			want: true,
+		},
+		{
+			name: "direct sandbox without pod IP",
+			sbx:  &agentsv1alpha1.Sandbox{},
+		},
+		{
+			name: "hostname sandbox uses endpoint address despite placeholder pod IP",
+			sbx: &agentsv1alpha1.Sandbox{Status: agentsv1alpha1.SandboxStatus{
+				PodInfo: agentsv1alpha1.PodInfo{PodIP: "169.254.1.1"},
+				Endpoint: &agentsv1alpha1.SandboxEndpoint{
+					Mode:    agentsv1alpha1.SandboxEndpointModeHostname,
+					Address: "front.example.com:443",
+				},
+			}},
+			want: true,
+		},
+		{
+			name: "hostname sandbox without address ignores pod IP",
+			sbx: &agentsv1alpha1.Sandbox{Status: agentsv1alpha1.SandboxStatus{
+				PodInfo: agentsv1alpha1.PodInfo{PodIP: "169.254.1.1"},
+				Endpoint: &agentsv1alpha1.SandboxEndpoint{
+					Mode: agentsv1alpha1.SandboxEndpointModeHostname,
+				},
+			}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, IsSandboxAddressable(tt.sbx))
+		})
+	}
+}

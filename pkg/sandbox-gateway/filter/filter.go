@@ -19,13 +19,15 @@ package filter
 import (
 	"crypto/subtle"
 	"fmt"
-
 	"github.com/envoyproxy/envoy/contrib/golang/common/go/api"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"net"
+	"strings"
 
 	agentsv1alpha1 "github.com/openkruise/agents/api/v1alpha1"
 	"github.com/openkruise/agents/pkg/sandbox-gateway/registry"
+	"github.com/openkruise/agents/pkg/sandboxendpoint"
 	"github.com/openkruise/agents/pkg/sandboxroute"
 	"github.com/openkruise/agents/pkg/servers/e2b/adapters"
 	"github.com/openkruise/agents/pkg/utils"
@@ -67,6 +69,12 @@ type sandboxFilter struct {
 }
 
 func (f *sandboxFilter) DecodeHeaders(header api.RequestHeaderMap, endStream bool) api.StatusType {
+	// Internal endpoint headers are control-plane output, never client input.
+	// Clear them before parsing so every early Continue path is fail-closed.
+	header.Del(sandboxendpoint.InternalRouteHeader)
+	header.Del(sandboxendpoint.InternalHostHeader)
+	header.Del(sandboxendpoint.InternalPortHeader)
+	header.Set(sandboxendpoint.InternalRouteHeader, sandboxendpoint.RouteDirect)
 	// Step 1: Build flat headers map from the request, including pseudo-headers
 	headers := make(map[string]string)
 	header.Range(func(key, value string) bool {
@@ -84,13 +92,23 @@ func (f *sandboxFilter) DecodeHeaders(header api.RequestHeaderMap, endStream boo
 			zap.String("authority", parsed.Authority),
 			zap.String("path", parsed.Path),
 			zap.Error(err))
+		f.callbacks.ClearRouteCache()
 		return api.Continue
 	}
 
 	logger.Debug("DecodeHeaders: adapter mapped request",
 		zap.String("sandboxID", sandboxID),
-		zap.Int("sandboxPort", sandboxPort),
-		zap.Any("extraHeaders", extraHeaders))
+		zap.Int("sandboxPort", sandboxPort))
+	if sandboxPort < 1 || sandboxPort > 65535 {
+		f.callbacks.DecoderFilterCallbacks().SendLocalReply(
+			400,
+			fmt.Sprintf("invalid sandbox port: %d", sandboxPort),
+			nil,
+			-1,
+			"invalid_sandbox_port",
+		)
+		return api.LocalReply
+	}
 
 	// Look up the pod IP from registry. Readiness is read separately from the
 	// route lookup, so a concurrent SetReady may flip between the two. ready
@@ -138,19 +156,65 @@ func (f *sandboxFilter) DecodeHeaders(header api.RequestHeaderMap, endStream boo
 		return status
 	}
 
-	// Apply extra headers from the adapter (e.g., :path rewrite for kruise custom protocol)
+	// Apply adapter normalization before adding the endpoint's own path prefix.
 	for k, v := range extraHeaders {
 		header.Set(k, v)
 	}
 
-	upstreamHost := fmt.Sprintf("%s:%d", route.IP, sandboxPort)
-	f.callbacks.StreamInfo().DynamicMetadata().Set("envoy.lb.original_dst", "host", upstreamHost)
-	if f.config.EnableRuntimeMTLS && sandboxPort == utils.RuntimePort {
-		f.callbacks.StreamInfo().DynamicMetadata().Set(runtimeMTLSMetadataNamespace, runtimeMTLSMetadataKey, true)
-		f.callbacks.ClearRouteCache()
+	target, err := route.ResolveEndpoint(sandboxPort)
+	if err != nil {
+		logger.Warn("Sandbox endpoint is not addressable", zap.String("sandboxID", sandboxID), zap.Error(err))
+		f.callbacks.DecoderFilterCallbacks().SendLocalReply(
+			502,
+			"sandbox endpoint is not addressable",
+			nil,
+			-1,
+			"sandbox_endpoint_invalid",
+		)
+		return api.LocalReply
 	}
 
-	logger.Debug("Upstream override set successfully", zap.String("upstreamHost", upstreamHost))
+	if !target.ViaFront {
+		header.Set(sandboxendpoint.InternalRouteHeader, sandboxendpoint.RouteDirect)
+		f.callbacks.StreamInfo().DynamicMetadata().Set("envoy.lb.original_dst", "host", target.DialHost)
+		if f.config.EnableRuntimeMTLS && sandboxPort == utils.RuntimePort {
+			f.callbacks.StreamInfo().DynamicMetadata().Set(runtimeMTLSMetadataNamespace, runtimeMTLSMetadataKey, true)
+		}
+		logger.Debug("Direct upstream override set", zap.String("upstreamHost", target.DialHost))
+	} else {
+		for name, value := range target.Headers {
+			header.Set(name, value)
+		}
+		if target.Authority != "" {
+			header.Set(":authority", target.Authority)
+		}
+		if target.PathPrefix != "" {
+			currentPath := parsed.Path
+			if mappedPath, ok := extraHeaders[":path"]; ok {
+				currentPath = mappedPath
+			}
+			header.Set(":path", sandboxendpoint.RewritePath(target.PathPrefix, currentPath))
+		}
+		host, port, splitErr := net.SplitHostPort(target.DialHost)
+		if splitErr != nil {
+			f.callbacks.DecoderFilterCallbacks().SendLocalReply(
+				502,
+				"sandbox front address is invalid",
+				nil,
+				-1,
+				"sandbox_front_address_invalid",
+			)
+			return api.LocalReply
+		}
+		header.Set(sandboxendpoint.InternalHostHeader, host)
+		header.Set(sandboxendpoint.InternalPortHeader, port)
+		header.Set(sandboxendpoint.InternalRouteHeader, sandboxendpoint.RouteFrontHTTP)
+		if strings.EqualFold(target.Scheme, "https") {
+			header.Set(sandboxendpoint.InternalRouteHeader, sandboxendpoint.RouteFrontHTTPS)
+		}
+		logger.Debug("Front upstream override set", zap.String("scheme", target.Scheme))
+	}
+	f.callbacks.ClearRouteCache()
 	return api.Continue
 }
 

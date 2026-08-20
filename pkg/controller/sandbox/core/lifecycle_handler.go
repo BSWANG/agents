@@ -23,6 +23,7 @@ import (
 	"time"
 
 	agentsv1alpha1 "github.com/openkruise/agents/api/v1alpha1"
+	"github.com/openkruise/agents/pkg/utils"
 	agentsruntime "github.com/openkruise/agents/pkg/utils/runtime"
 	"github.com/openkruise/agents/proto/envd/process"
 )
@@ -52,10 +53,11 @@ func ExecuteLifecycleHook(ctx context.Context, box *agentsv1alpha1.Sandbox, acti
 		return 0, "", "", nil
 	}
 
-	// Check runtime URL availability
-	runtimeURL := agentsruntime.GetRuntimeURL(box)
-	if runtimeURL == "" {
-		return -1, "", "", fmt.Errorf("runtime URL not found on sandbox %s/%s", box.Namespace, box.Name)
+	// The command itself resolves the endpoint through the shared runtime client.
+	// Check addressability rather than the legacy Pod-IP URL so a Hostname
+	// endpoint remains usable when PodInfo is intentionally empty.
+	if !utils.IsSandboxAddressable(box) {
+		return -1, "", "", fmt.Errorf("runtime endpoint not found on sandbox %s/%s", box.Namespace, box.Name)
 	}
 
 	// Determine timeout

@@ -552,8 +552,8 @@ func pickAnAvailableSandbox(ctx context.Context, opts infra.ClaimSandboxOptions,
 			if len(availableCandidates) >= cnt {
 				continue
 			}
-			if obj.Status.PodInfo.PodIP == "" {
-				log.Info("skip available sandbox without podIP", "sandbox", klog.KObj(obj))
+			if !utils.IsSandboxAddressable(obj) {
+				log.Info("skip available sandbox without an addressable endpoint", "sandbox", klog.KObj(obj))
 				continue
 			}
 			availableCandidates = append(availableCandidates, obj)
@@ -923,8 +923,8 @@ func sandboxReadyFailureReason(sbx *v1alpha1.Sandbox, state string, readyCond, i
 	if inplaceCond.Reason == v1alpha1.SandboxInplaceUpdateReasonInplaceUpdating {
 		return "inplace update is still in progress"
 	}
-	if sbx.Status.PodInfo.PodIP == "" {
-		return "sandbox has no pod IP"
+	if !utils.IsSandboxAddressable(sbx) {
+		return "sandbox has no addressable endpoint"
 	}
 	if readyCond.Reason == v1alpha1.SandboxReadyReasonStartContainerFailed {
 		reason := fmt.Sprintf("ready condition reports %s", readyCond.Reason)
@@ -967,10 +967,10 @@ func checkSandboxReady(ctx context.Context, sbx *v1alpha1.Sandbox) (bool, error)
 		return false, nil
 	}
 
-	ip := sbx.Status.PodInfo.PodIP
+	addressable := utils.IsSandboxAddressable(sbx)
 	state, reason := utils.GetSandboxState(sbx)
-	isReady := state == v1alpha1.SandboxStateRunning && ip != ""
-	log.Info("sandbox ready checked", "state", state, "reason", reason, "ip", ip, "isReady", isReady, "resourceVersion", sbx.GetResourceVersion())
+	isReady := state == v1alpha1.SandboxStateRunning && addressable
+	log.Info("sandbox ready checked", "state", state, "reason", reason, "addressable", addressable, "isReady", isReady, "resourceVersion", sbx.GetResourceVersion())
 	if isReady {
 		// Expect the resourceVersion to ensure InplaceRefresh fetches the latest from API server
 		expectations.ResourceVersionExpectationExpect(sbx)

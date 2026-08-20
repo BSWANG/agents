@@ -18,6 +18,8 @@ package proxyutils
 
 import (
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strconv"
 	"testing"
@@ -103,4 +105,49 @@ func TestRequestSandbox(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRequestSandboxViaHostnameEndpoint(t *testing.T) {
+	type request struct {
+		host   string
+		path   string
+		header http.Header
+	}
+	seen := make(chan request, 1)
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- request{host: r.Host, path: r.URL.Path, header: r.Header.Clone()}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer front.Close()
+
+	parsed, err := url.Parse(front.URL)
+	require.NoError(t, err)
+	sandbox := &v1alpha1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "hostname-sandbox", Namespace: "default"},
+		Status: v1alpha1.SandboxStatus{
+			Phase:   v1alpha1.SandboxRunning,
+			PodInfo: v1alpha1.PodInfo{PodIP: "169.254.1.1"},
+			Endpoint: &v1alpha1.SandboxEndpoint{
+				Mode:       v1alpha1.SandboxEndpointModeHostname,
+				Address:    parsed.Host,
+				Scheme:     "http",
+				Authority:  "{port}-hostname-sandbox.sbx.example.com",
+				PathPrefix: "/kruise/hostname-sandbox/{port}",
+				Headers: map[string]string{
+					"e2b-sandbox-id":   "hostname-sandbox",
+					"e2b-sandbox-port": "{port}",
+				},
+			},
+		},
+	}
+
+	resp, err := requestSandbox(t.Context(), sandbox, http.MethodGet, "/json/version", 9222, nil)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+
+	got := <-seen
+	assert.Equal(t, "9222-hostname-sandbox.sbx.example.com", got.host)
+	assert.Equal(t, "/kruise/hostname-sandbox/9222/json/version", got.path)
+	assert.Equal(t, "hostname-sandbox", got.header.Get("e2b-sandbox-id"))
+	assert.Equal(t, "9222", got.header.Get("e2b-sandbox-port"))
 }

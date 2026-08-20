@@ -125,7 +125,7 @@ func (c *Cache) NewSandboxWaitReadyTask(ctx context.Context, sbx *agentsv1alpha1
 			return false, nil
 		}
 		state, _ := utils.GetSandboxState(s)
-		return state == agentsv1alpha1.SandboxStateRunning && s.Status.PodInfo.PodIP != "", nil
+		return state == agentsv1alpha1.SandboxStateRunning && utils.IsSandboxAddressable(s), nil
 	}
 	return cacheutils.NewWaitTask[*agentsv1alpha1.Sandbox](
 		ctx, c.waitHooks, cacheutils.WaitActionWaitReady, sbx, c.SandboxUpdateFunc(ctx), check,

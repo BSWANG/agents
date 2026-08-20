@@ -154,16 +154,25 @@ func TestTLSMode_OneShotTransportDoesNotLeakConnections(t *testing.T) {
 }
 
 // TestTLSMode_InvalidCAIsPermanentError verifies that an unusable CA bundle is
-// reported as a permanent error on the first call instead of being retried.
+// reported as a permanent error on the first call instead of being retried. The
+// attempt count is part of the assertion: the failure is decided at construction
+// time, so retrying it only delays the report by the whole backoff. The refresh
+// hook runs once per attempt, which is what makes attempts observable here.
 func TestTLSMode_InvalidCAIsPermanentError(t *testing.T) {
+	attempts := 0
 	rt := NewRuntime(
 		sandboxWithPodIP("10.0.0.1"),
 		WithRetry(fastBackoff),
 		WithTLS(TLSBundle{CABundle: []byte("not a pem")}),
+		WithRefresh(func(context.Context) (*agentsv1alpha1.Sandbox, error) {
+			attempts++
+			return nil, nil
+		}),
 	)
 	_, err := rt.Storage().Mount(context.Background(), testMountRequest("oss"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid runtime TLS configuration")
+	assert.Equal(t, 1, attempts, "an unusable TLS bundle must not be retried")
 }
 
 // TestBuildClientTLSConfig covers the bundle validation branches.

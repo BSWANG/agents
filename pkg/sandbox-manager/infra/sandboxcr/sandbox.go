@@ -65,7 +65,13 @@ type Sandbox struct {
 	trafficToken *identity.TokenResponse
 }
 
-func (s *Sandbox) GetIP() string {
+func (s *Sandbox) GetEndpointAddress() string {
+	if !utils.IsSandboxAddressable(s.Sandbox) {
+		return ""
+	}
+	if s.Status.Endpoint != nil && s.Status.Endpoint.Mode == agentsv1alpha1.SandboxEndpointModeHostname {
+		return s.Status.Endpoint.Address
+	}
 	return s.Status.PodInfo.PodIP
 }
 

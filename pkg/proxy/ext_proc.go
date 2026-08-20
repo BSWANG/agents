@@ -21,9 +21,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
-
 	configPb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	extProcPb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	types "github.com/envoyproxy/go-control-plane/envoy/type/v3"
@@ -31,9 +28,14 @@ import (
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"io"
 	"k8s.io/klog/v2"
+	"net"
+	"net/http"
+	"strings"
 
 	agentsv1alpha1 "github.com/openkruise/agents/api/v1alpha1"
+	"github.com/openkruise/agents/pkg/sandboxendpoint"
 	"github.com/openkruise/agents/pkg/utils"
 )
 
@@ -105,7 +107,8 @@ func (s *Server) handleRequestHeaders(requestHeaders *extProcPb.ProcessingReques
 	log.Info("envoy ext processor parsed request", "scheme", scheme, "authority", authority, "path", path, "port", parsed.Port, "headers", headers)
 	if !s.adapter.IsSandboxRequest(authority, path, parsed.Port) {
 		return s.logAndCreateDstResponse(requestHeaders.RequestHeaders, map[string]string{
-			OrigDstHeader: s.LBEntry,
+			OrigDstHeader:                       s.LBEntry,
+			sandboxendpoint.InternalRouteHeader: sandboxendpoint.RouteDirect,
 		}, log)
 	}
 	sandboxID, sandboxPort, extraHeaders, err := s.adapter.Map(parsed)
@@ -115,11 +118,11 @@ func (s *Server) handleRequestHeaders(requestHeaders *extProcPb.ProcessingReques
 		errorMsg := fmt.Sprintf("failed to map request to sandbox, URL=%s://%s%s", scheme, authority, path)
 		return s.logAndCreateErrorResponse(http.StatusInternalServerError, errorMsg, log)
 	}
-	if sandboxPort < 0 || sandboxPort > 65535 {
+	if sandboxPort < 1 || sandboxPort > 65535 {
 		errorMsg := fmt.Sprintf("invalid sandbox port: %d", sandboxPort)
 		return s.logAndCreateErrorResponse(http.StatusBadRequest, errorMsg, log)
 	}
-	log.Info("request mapped", "sandboxID", sandboxID, "sandboxPort", sandboxPort, "extraHeaders", extraHeaders)
+	log.Info("request mapped", "sandboxID", sandboxID, "sandboxPort", sandboxPort)
 
 	errorMsg := fmt.Sprintf("healthy sandbox %s not found", sandboxID)
 	route, ok := s.LoadRoute(sandboxID)
@@ -134,9 +137,38 @@ func (s *Server) handleRequestHeaders(requestHeaders *extProcPb.ProcessingReques
 	if extraHeaders == nil {
 		extraHeaders = make(map[string]string)
 	}
-	// An adapter can set "x-envoy-original-dst-host" header to force route the request to a specific destination
-	if _, ok := extraHeaders[OrigDstHeader]; !ok {
-		extraHeaders[OrigDstHeader] = fmt.Sprintf("%s:%d", route.IP, sandboxPort)
+	target, err := route.ResolveEndpoint(sandboxPort)
+	if err != nil {
+		log.Error(err, "failed to resolve sandbox endpoint", "sandboxID", sandboxID, "sandboxPort", sandboxPort)
+		return s.logAndCreateErrorResponse(http.StatusBadGateway, "sandbox endpoint is not addressable", log)
+	}
+	extraHeaders[OrigDstHeader] = target.DialHost
+	if !target.ViaFront {
+		extraHeaders[sandboxendpoint.InternalRouteHeader] = sandboxendpoint.RouteDirect
+	} else {
+		for name, value := range target.Headers {
+			extraHeaders[name] = value
+		}
+		if target.Authority != "" {
+			extraHeaders[":authority"] = target.Authority
+		}
+		currentPath := headers[":path"]
+		if mappedPath, ok := extraHeaders[":path"]; ok {
+			currentPath = mappedPath
+		}
+		if target.PathPrefix != "" {
+			extraHeaders[":path"] = sandboxendpoint.RewritePath(target.PathPrefix, currentPath)
+		}
+		host, port, splitErr := net.SplitHostPort(target.DialHost)
+		if splitErr != nil {
+			return s.logAndCreateErrorResponse(http.StatusBadGateway, "sandbox front address is invalid", log)
+		}
+		extraHeaders[sandboxendpoint.InternalHostHeader] = host
+		extraHeaders[sandboxendpoint.InternalPortHeader] = port
+		extraHeaders[sandboxendpoint.InternalRouteHeader] = sandboxendpoint.RouteFrontHTTP
+		if strings.EqualFold(target.Scheme, "https") {
+			extraHeaders[sandboxendpoint.InternalRouteHeader] = sandboxendpoint.RouteFrontHTTPS
+		}
 	}
 
 	return s.logAndCreateDstResponse(requestHeaders.RequestHeaders, extraHeaders, log)
@@ -144,14 +176,20 @@ func (s *Server) handleRequestHeaders(requestHeaders *extProcPb.ProcessingReques
 
 func (s *Server) logAndCreateDstResponse(requestHeaders *extProcPb.HttpHeaders,
 	extraHeaders map[string]string, log logr.Logger) *extProcPb.ProcessingResponse {
-	log.Info("will modify request headers", "headers", extraHeaders)
-	setHeaders := make([]*configPb.HeaderValueOption, 0, len(extraHeaders))
+	log.Info("will modify request headers", "headerCount", len(extraHeaders))
+	// Client-requested modifiers are applied first. Trusted endpoint routing
+	// mutations follow and therefore cannot be replaced by an untrusted
+	// request-header-modifier value with the same name.
+	modifiers := headerModifiers("request-header-modifier", requestHeaders, log)
+	setHeaders := make([]*configPb.HeaderValueOption, 0, len(extraHeaders)+len(modifiers))
+	setHeaders = append(setHeaders, modifiers...)
 	for k, v := range extraHeaders {
 		setHeaders = append(setHeaders, &configPb.HeaderValueOption{
 			Header: &configPb.HeaderValue{
 				Key:      k,
 				RawValue: []byte(v),
 			},
+			AppendAction: configPb.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
 		})
 	}
 	resp := &extProcPb.ProcessingResponse{
@@ -161,13 +199,11 @@ func (s *Server) logAndCreateDstResponse(requestHeaders *extProcPb.HttpHeaders,
 					HeaderMutation: &extProcPb.HeaderMutation{
 						SetHeaders: setHeaders,
 					},
+					ClearRouteCache: true,
 				},
 			},
 		},
 	}
-	resp.Response.(*extProcPb.ProcessingResponse_RequestHeaders).RequestHeaders.Response.HeaderMutation.SetHeaders = append(
-		resp.Response.(*extProcPb.ProcessingResponse_RequestHeaders).RequestHeaders.Response.HeaderMutation.SetHeaders,
-		headerModifiers("request-header-modifier", requestHeaders, log)...)
 	return resp
 }
 

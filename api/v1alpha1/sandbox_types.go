@@ -261,6 +261,12 @@ type SandboxStatus struct {
 	// +optional
 	SandboxIp string `json:"sandboxIp,omitempty"`
 
+	// Endpoint declares how this sandbox is addressed. A nil Endpoint means
+	// SandboxEndpointModeDirect via PodInfo.PodIP, which is the behavior of every
+	// sandbox created before this field existed.
+	// +optional
+	Endpoint *SandboxEndpoint `json:"endpoint,omitempty"`
+
 	// UpdateRevision is the template-hash calculated from `spec.template`.
 	// +optional
 	UpdateRevision string `json:"updateRevision,omitempty"`
@@ -300,6 +306,52 @@ const (
 	// SandboxTerminating means sandbox will perform cleanup after deletion.
 	SandboxTerminating SandboxPhase = "Terminating"
 )
+
+// SandboxEndpointMode is how a sandbox is addressed.
+// +enum
+type SandboxEndpointMode string
+
+const (
+	// SandboxEndpointModeDirect addresses the sandbox at its Pod IP, which is the
+	// behavior of every sandbox that declares no endpoint.
+	SandboxEndpointModeDirect SandboxEndpointMode = "Direct"
+	// SandboxEndpointModeHostname addresses the sandbox through an L7 front, which
+	// selects it from the request rather than from the connection.
+	SandboxEndpointModeHostname SandboxEndpointMode = "Hostname"
+)
+
+// SandboxEndpoint describes how to reach one sandbox. Everything a caller needs
+// is here, so no component takes addressing flags. Only {port} is substituted at
+// call time, because the caller picks the port per call; every other value is
+// resolved when this field is written.
+type SandboxEndpoint struct {
+	// Mode is the addressing mode.
+	Mode SandboxEndpointMode `json:"mode"`
+
+	// Address is the host and port to connect to, e.g. sbx-alb.example.com:443.
+	// Required when Mode is Hostname.
+	// +optional
+	Address string `json:"address,omitempty"`
+
+	// Scheme is http or https for the hop to Address. Defaults to https.
+	// +optional
+	Scheme string `json:"scheme,omitempty"`
+
+	// Authority replaces the Host / :authority header, e.g.
+	// {port}-sbx7f3a.sbx.example.com. Empty keeps Address as the authority.
+	// +optional
+	Authority string `json:"authority,omitempty"`
+
+	// PathPrefix is prepended to the request path, e.g. /kruise/sbx7f3a/{port}.
+	// +optional
+	PathPrefix string `json:"pathPrefix,omitempty"`
+
+	// Headers are sent with every request to this sandbox, e.g.
+	// {"e2b-sandbox-id": "sbx7f3a", "e2b-sandbox-port": "{port}"}.
+	// +optional
+	// +mapType=granular
+	Headers map[string]string `json:"headers,omitempty"`
+}
 
 // TODO Some external controllers have specific conditions, whether to keep them
 type PodInfo struct {

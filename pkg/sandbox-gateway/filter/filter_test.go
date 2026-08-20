@@ -29,6 +29,7 @@ import (
 	agentsv1alpha1 "github.com/openkruise/agents/api/v1alpha1"
 	"github.com/openkruise/agents/pkg/identity/oidc"
 	"github.com/openkruise/agents/pkg/sandbox-gateway/registry"
+	"github.com/openkruise/agents/pkg/sandboxendpoint"
 	"github.com/openkruise/agents/pkg/sandboxroute"
 	"github.com/openkruise/agents/pkg/servers/e2b/adapters"
 )
@@ -413,6 +414,22 @@ func (m *mockFilterCallbackHandler) EncoderFilterCallbacks() api.EncoderFilterCa
 	return nil
 }
 
+func TestDecodeHeadersClearsUntrustedEndpointHeaders(t *testing.T) {
+	filter, callbacks := newTestFilter(DefaultConfig())
+	header := newMockRequestHeaderMap()
+	header.Set(sandboxendpoint.InternalRouteHeader, sandboxendpoint.RouteFrontHTTPS)
+	header.Set(sandboxendpoint.InternalHostHeader, "attacker.example.com")
+	header.Set(sandboxendpoint.InternalPortHeader, "443")
+
+	status := filter.DecodeHeaders(header, true)
+
+	assert.Equal(t, api.Continue, status)
+	assert.Equal(t, sandboxendpoint.RouteDirect, header.GetRaw(sandboxendpoint.InternalRouteHeader))
+	assert.Empty(t, header.GetRaw(sandboxendpoint.InternalHostHeader))
+	assert.Empty(t, header.GetRaw(sandboxendpoint.InternalPortHeader))
+	assert.Equal(t, 1, callbacks.clearRouteCalls)
+}
+
 // TestDecodeHeadersExtractionVectors covers every routable ID/port extraction
 // vector: the matrix of parsing itself is authoritative in the adapters package.
 func TestDecodeHeadersExtractionVectors(t *testing.T) {
@@ -475,7 +492,7 @@ func TestDecodeHeadersExtractionVectors(t *testing.T) {
 				return newSandboxHeader("default--ipv6-sandbox")
 			},
 			endStream: true,
-			wantHost:  "2001:db8::1:49983",
+			wantHost:  "[2001:db8::1]:49983",
 		},
 		{
 			name:   "IPv6 upstream via host header",
@@ -484,7 +501,7 @@ func TestDecodeHeadersExtractionVectors(t *testing.T) {
 				return newHostHeader("8080-default--ipv6-sandbox.example.com")
 			},
 			endStream: true,
-			wantHost:  "2001:db8::1:8080",
+			wantHost:  "[2001:db8::1]:8080",
 		},
 		{
 			name:   "kruise custom protocol rewrites the path",
@@ -529,6 +546,39 @@ func TestDecodeHeadersExtractionVectors(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDecodeHeadersHostnameEndpoint(t *testing.T) {
+	routeRegistry := useTestRegistry(t)
+	putTestRoute(t, routeRegistry, "default--hostname", sandboxroute.Route{
+		State: agentsv1alpha1.SandboxStateRunning,
+		Endpoint: &agentsv1alpha1.SandboxEndpoint{
+			Mode:       agentsv1alpha1.SandboxEndpointModeHostname,
+			Address:    "front.example.com:8443",
+			Scheme:     "https",
+			Authority:  "{port}-hostname.sbx.example.com",
+			PathPrefix: "/relay/hostname/{port}",
+			Headers:    map[string]string{"x-sandbox": "hostname", "x-port": "{port}"},
+		},
+	})
+	filter, callbacks := newTestFilter(DefaultConfig())
+	header := newMockRequestHeaderMap()
+	header.Set(DefaultSandboxHeaderName, "default--hostname")
+	header.Set(DefaultSandboxPortHeader, "9222")
+
+	status := filter.DecodeHeaders(header, true)
+
+	require.Equal(t, api.Continue, status)
+	assert.False(t, callbacks.decoderCallbacks.sendLocalReplyCalled)
+	assert.Equal(t, "front.example.com", header.GetRaw(sandboxendpoint.InternalHostHeader))
+	assert.Equal(t, "8443", header.GetRaw(sandboxendpoint.InternalPortHeader))
+	assert.Equal(t, sandboxendpoint.RouteFrontHTTPS, header.GetRaw(sandboxendpoint.InternalRouteHeader))
+	assert.Equal(t, "9222-hostname.sbx.example.com", header.GetRaw(":authority"))
+	assert.Equal(t, "/relay/hostname/9222/", header.GetRaw(":path"))
+	assert.Equal(t, "hostname", header.GetRaw("x-sandbox"))
+	assert.Equal(t, "9222", header.GetRaw("x-port"))
+	assert.Nil(t, callbacks.streamInfo.dynamicMetadata.data["envoy.lb.original_dst"])
+	assert.Equal(t, 1, callbacks.clearRouteCalls)
 }
 
 // TestDecodeHeadersLocalReplies covers every local-reply branch: missing route,
@@ -757,11 +807,10 @@ func TestDecodeHeadersRuntimeMTLSRouting(t *testing.T) {
 			metadata := callbacks.streamInfo.dynamicMetadata.data[runtimeMTLSMetadataNamespace]
 			if tt.wantMTLS {
 				assert.Equal(t, true, metadata[runtimeMTLSMetadataKey])
-				assert.Equal(t, 1, callbacks.clearRouteCalls)
 			} else {
 				assert.Nil(t, metadata)
-				assert.Zero(t, callbacks.clearRouteCalls)
 			}
+			assert.Equal(t, 1, callbacks.clearRouteCalls)
 			if tt.wantPath != "" {
 				path, ok := header.Get(":path")
 				assert.True(t, ok)

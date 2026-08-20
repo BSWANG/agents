@@ -19,13 +19,13 @@ package proxy
 import (
 	"context"
 	"io"
-	"sort"
 	"testing"
 	"time"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	extProcPb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	types "github.com/envoyproxy/go-control-plane/envoy/type/v3"
+	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -33,6 +33,7 @@ import (
 
 	agentsv1alpha1 "github.com/openkruise/agents/api/v1alpha1"
 	"github.com/openkruise/agents/pkg/sandbox-manager/config"
+	"github.com/openkruise/agents/pkg/sandboxendpoint"
 	"github.com/openkruise/agents/pkg/sandboxroute"
 	"github.com/openkruise/agents/pkg/servers/e2b/adapters"
 )
@@ -573,31 +574,21 @@ func TestServer_Process(t *testing.T) {
 								if actualHeader.RequestHeaders.Response.HeaderMutation == nil {
 									t.Errorf("expect HeaderMutation")
 								} else {
-									// Check number of set headers
 									expectedHeaders := expectedHeader.RequestHeaders.Response.HeaderMutation.SetHeaders
 									actualHeaders := actualHeader.RequestHeaders.Response.HeaderMutation.SetHeaders
-									if len(expectedHeaders) != len(actualHeaders) {
-										t.Errorf("expect %d setHeaders, got %d", len(expectedHeaders), len(actualHeaders))
+									actualByName := make(map[string]string, len(actualHeaders))
+									for _, header := range actualHeaders {
+										actualByName[header.Header.Key] = string(header.Header.RawValue)
 									}
-
-									sort.Slice(actualHeaders, func(i, j int) bool {
-										return actualHeaders[i].Header.Key < actualHeaders[j].Header.Key
-									})
-									sort.Slice(expectedHeaders, func(i, j int) bool {
-										return expectedHeaders[i].Header.Key < expectedHeaders[j].Header.Key
-									})
-
-									// Check each header
-									for j, expectedHeader := range expectedHeaders {
-										if j >= len(actualHeaders) {
+									for _, expectedHeader := range expectedHeaders {
+										actualValue, found := actualByName[expectedHeader.Header.Key]
+										if !found {
+											t.Errorf("expected header %s was not set", expectedHeader.Header.Key)
 											continue
 										}
-										actualHeader := actualHeaders[j]
-
-										if string(expectedHeader.Header.RawValue) != string(actualHeader.Header.RawValue) {
-											t.Errorf("header key %s not match, expect: %s, actual: %s", expectedHeader.Header.Key,
-												string(expectedHeader.Header.RawValue),
-												string(actualHeader.Header.RawValue))
+										if expectedValue := string(expectedHeader.Header.RawValue); actualValue != expectedValue {
+											t.Errorf("header %s not match, expect: %s, actual: %s",
+												expectedHeader.Header.Key, expectedValue, actualValue)
 										}
 									}
 								}
@@ -631,6 +622,7 @@ func TestServer_Run_Stop(t *testing.T) {
 
 	// Create server
 	server := NewServer(config.SandboxManagerOptions{ExtProcMaxConcurrency: 1000})
+
 	server.SetRequestAdapter(adapter)
 
 	// Start server in background
@@ -644,4 +636,90 @@ func TestServer_Run_Stop(t *testing.T) {
 
 	// Stop server
 	server.Stop(t.Context())
+}
+func TestHandleRequestHeadersHostnameEndpoint(t *testing.T) {
+	server := NewServer(config.SandboxManagerOptions{})
+	server.SetRequestAdapter(&testRequestAdapter{
+		isSandboxRequest: true,
+		mapResult: mapResult{
+			sandboxID:   "sandbox1",
+			sandboxPort: 9222,
+		},
+	})
+	server.SetRoute(sandboxroute.Route{
+		ID:              "sandbox1",
+		Namespace:       "ns",
+		Name:            "sandbox1",
+		UID:             "uid-sandbox1",
+		State:           agentsv1alpha1.SandboxStateRunning,
+		ResourceVersion: "1",
+		Endpoint: &agentsv1alpha1.SandboxEndpoint{
+			Mode:       agentsv1alpha1.SandboxEndpointModeHostname,
+			Address:    "front.example.com:8443",
+			Scheme:     "https",
+			Authority:  "{port}-sandbox1.sbx.example.com",
+			PathPrefix: "/relay/sandbox1/{port}",
+			Headers:    map[string]string{"x-sandbox": "sandbox1", "x-port": "{port}"},
+		},
+	})
+	request := &extProcPb.ProcessingRequest_RequestHeaders{
+		RequestHeaders: &extProcPb.HttpHeaders{Headers: &corev3.HeaderMap{Headers: []*corev3.HeaderValue{
+			{Key: ":scheme", RawValue: []byte("http")},
+			{Key: ":authority", RawValue: []byte("incoming.example.com")},
+			{Key: ":path", RawValue: []byte("/original?q=1")},
+			{Key: "request-header-modifier", RawValue: []byte(`{"x-agents-sandbox-endpoint-route":"front-http","x-agents-sandbox-endpoint-host":"attacker.example.com","x-sandbox":"attacker"}`)},
+			{Key: OrigDstHeader, RawValue: []byte("attacker.example.com:8080")},
+		}}},
+	}
+
+	response := server.handleRequestHeaders(request, logr.Discard())
+
+	headerResponse := response.Response.(*extProcPb.ProcessingResponse_RequestHeaders)
+	assert.True(t, headerResponse.RequestHeaders.Response.ClearRouteCache)
+	got := make(map[string]string)
+	actions := make(map[string]corev3.HeaderValueOption_HeaderAppendAction)
+	for _, header := range headerResponse.RequestHeaders.Response.HeaderMutation.SetHeaders {
+		got[header.Header.Key] = string(header.Header.RawValue)
+		actions[header.Header.Key] = header.AppendAction
+	}
+	for _, name := range []string{
+		sandboxendpoint.InternalRouteHeader,
+		sandboxendpoint.InternalHostHeader,
+		sandboxendpoint.InternalPortHeader,
+		OrigDstHeader,
+	} {
+		assert.Equal(t, corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD, actions[name])
+	}
+	assert.Equal(t, sandboxendpoint.RouteFrontHTTPS, got[sandboxendpoint.InternalRouteHeader])
+	assert.Equal(t, "front.example.com", got[sandboxendpoint.InternalHostHeader])
+	assert.Equal(t, "8443", got[sandboxendpoint.InternalPortHeader])
+	assert.Equal(t, "9222-sandbox1.sbx.example.com", got[":authority"])
+	assert.Equal(t, "/relay/sandbox1/9222/original?q=1", got[":path"])
+	assert.Equal(t, "sandbox1", got["x-sandbox"])
+	assert.Equal(t, "9222", got["x-port"])
+	assert.Equal(t, "front.example.com:8443", got[OrigDstHeader])
+}
+
+func TestNonSandboxRequestClearsUntrustedEndpointRoute(t *testing.T) {
+	server := NewServer(config.SandboxManagerOptions{})
+	server.SetRequestAdapter(&testRequestAdapter{isSandboxRequest: false})
+	request := &extProcPb.ProcessingRequest_RequestHeaders{
+		RequestHeaders: &extProcPb.HttpHeaders{Headers: &corev3.HeaderMap{Headers: []*corev3.HeaderValue{
+			{Key: sandboxendpoint.InternalRouteHeader, RawValue: []byte(sandboxendpoint.RouteFrontHTTPS)},
+			{Key: sandboxendpoint.InternalHostHeader, RawValue: []byte("attacker.example.com")},
+		}}},
+	}
+
+	response := server.handleRequestHeaders(request, logr.Discard())
+
+	headerResponse := response.Response.(*extProcPb.ProcessingResponse_RequestHeaders)
+	assert.True(t, headerResponse.RequestHeaders.Response.ClearRouteCache)
+	got := make(map[string]string)
+	for _, header := range headerResponse.RequestHeaders.Response.HeaderMutation.SetHeaders {
+		got[header.Header.Key] = string(header.Header.RawValue)
+		if header.Header.Key == sandboxendpoint.InternalRouteHeader || header.Header.Key == OrigDstHeader {
+			assert.Equal(t, corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD, header.AppendAction)
+		}
+	}
+	assert.Equal(t, sandboxendpoint.RouteDirect, got[sandboxendpoint.InternalRouteHeader])
 }
